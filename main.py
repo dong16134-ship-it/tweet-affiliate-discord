@@ -2,6 +2,8 @@ from playwright.sync_api import sync_playwright
 import requests
 import time
 import os
+import threading
+from flask import Flask
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 AMAZON_TAG = os.getenv("AMAZON_TAG", "yiyigao0e-22")
@@ -14,6 +16,12 @@ PRODUCTS = [
         "asin": "B0FQGJTF74",
     },
 ]
+
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return "OK", 200
 
 def send_discord(message: str):
     if not DISCORD_WEBHOOK_URL:
@@ -30,13 +38,9 @@ def send_discord(message: str):
         print("发送 Discord 失败:", e)
 
 def check_amazon_in_stock(page, url: str) -> bool | None:
-    # 打开页面
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-    # 取整页文本
     body_text = page.text_content("body") or ""
 
-    # 典型有货/无货文案（可以后面根据实际页面再微调）
     in_words = [
         "カートに入れる",
         "今すぐ購入",
@@ -53,11 +57,10 @@ def check_amazon_in_stock(page, url: str) -> bool | None:
         return False
     if any(w in body_text for w in in_words):
         return True
-    return None  # 看不出来
+    return None
 
 def run_loop():
-    last_status = {}  # url -> bool
-
+    last_status = {}
     with sync_playwright() as p:
         while True:
             try:
@@ -76,7 +79,6 @@ def run_loop():
 
                     prev = last_status.get(url)
 
-                    # 从“无货/未知” -> “有货” 时才通知
                     if status and prev is not True:
                         aff_link = f"https://www.amazon.co.jp/dp/{asin}?tag={AMAZON_TAG}"
                         msg = (
@@ -95,5 +97,13 @@ def run_loop():
             print(f"休眠 {CHECK_INTERVAL} 秒\n")
             time.sleep(CHECK_INTERVAL)
 
+def start_background_loop():
+    t = threading.Thread(target=run_loop, daemon=True)
+    t.start()
+
 if __name__ == "__main__":
-    run_loop()
+    # 启动后台轮询线程
+    start_background_loop()
+    # 监听 Cloud Run 提供的 PORT（默认 8080）
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
