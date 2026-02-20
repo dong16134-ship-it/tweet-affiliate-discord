@@ -1,15 +1,19 @@
-# main.py
-from flask import Flask, request, jsonify
-import re
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-import os
+from playwright.sync_api import sync_playwright
 import requests
+import time
+import os
 
-app = Flask(__name__)
-
-# 环境变量里配置
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-MY_AMZ_TAG = os.getenv("MY_AMZ_TAG", "yiyigao0e-22")  # 你的联盟 tag
+AMAZON_TAG = os.getenv("AMAZON_TAG", "yiyigao0e-22")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # 每隔多少秒检查一次
+
+PRODUCTS = [
+    {
+        "name": "Apple iPhone 15 Pro Max 256GB コズミックオレンジ",
+        "url": "https://www.amazon.co.jp/dp/B0FQGJTF74",
+        "asin": "B0FQGJTF74",
+    },
+]
 
 def send_discord(message: str):
     if not DISCORD_WEBHOOK_URL:
@@ -25,75 +29,71 @@ def send_discord(message: str):
     except Exception as e:
         print("发送 Discord 失败:", e)
 
-def replace_amazon_tag(url: str) -> str:
-    if "amazon." not in url:
-        return url
-    parsed = urlparse(url)
+def check_amazon_in_stock(page, url: str) -> bool | None:
+    # 打开页面
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-    # 去掉 Amazon 的短链参数等，只保留必要的 + 你的 tag
-    qs = parse_qs(parsed.query)
-    qs["tag"] = [MY_AMZ_TAG]
+    # 取整页文本
+    body_text = page.text_content("body") or ""
 
-    new_qs = urlencode(qs, doseq=True)
-    new_parsed = parsed._replace(query=new_qs)
-    new_url = urlunparse(new_parsed)
-    print("重写 Amazon 链接:", url, "->", new_url)
-    return new_url
+    # 典型有货/无货文案（可以后面根据实际页面再微调）
+    in_words = [
+        "カートに入れる",
+        "今すぐ購入",
+        "お客様のお届け先にお届け",
+    ]
+    out_words = [
+        "現在お取り扱いできません",
+        "一時的に在庫切れ",
+        "在庫切れです",
+        "この商品は現在お取り扱いできません",
+    ]
 
-def extract_urls_from_text(text: str):
-    # 简单版本：按空格/换行分隔的 URL
-    urls = re.findall(r"https?://\S+", text)
-    return urls
+    if any(w in body_text for w in out_words):
+        return False
+    if any(w in body_text for w in in_words):
+        return True
+    return None  # 看不出来
 
-def build_affiliate_links(urls):
-    new_urls = []
-    for u in urls:
-        if "amazon." in u:
-            new_urls.append(replace_amazon_tag(u))
-        else:
-            # 其它平台先原样保留，之后你可以按平台扩展
-            new_urls.append(u)
-    return new_urls
+def run_loop():
+    last_status = {}  # url -> bool
 
-@app.route("/webhook", methods=["POST"])
-def handle_tweet():
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"status": "no_json"}), 400
+    with sync_playwright() as p:
+        while True:
+            try:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                print("开始一轮检查...")
 
-    # 第三方通常会给你 tweet 文本和一个唯一 ID
-    text = data.get("text") or ""
-    tweet_id = data.get("id") or data.get("tweet_id")  # 兼容不同服务字段
-    username = data.get("username") or data.get("user", {}).get("screen_name")
+                for item in PRODUCTS:
+                    name = item["name"]
+                    url = item["url"]
+                    asin = item["asin"]
 
-    print("收到推文:", tweet_id, "from", username)
-    print("原文:", text)
+                    print(f"检查 {name}: {url}")
+                    status = check_amazon_in_stock(page, url)
+                    print("有货判定:", status)
 
-    urls = extract_urls_from_text(text)
-    if not urls:
-        print("没有检测到 URL，跳过发送。")
-        return jsonify({"status": "no_urls"}), 200
+                    prev = last_status.get(url)
 
-    aff_urls = build_affiliate_links(urls)
+                    # 从“无货/未知” -> “有货” 时才通知
+                    if status and prev is not True:
+                        aff_link = f"https://www.amazon.co.jp/dp/{asin}?tag={AMAZON_TAG}"
+                        msg = (
+                            f"✅ Amazon 有货：{name}\n"
+                            f"🔗 {aff_link}"
+                        )
+                        send_discord(msg)
+                        last_status[url] = True
+                    elif status is False:
+                        last_status[url] = False
 
-    # 只发你自己的整理，不写来源
-    # 你可以按喜好调整格式
-    msg_lines = []
-    msg_lines.append("📢 新情报（自动整理）")
-    msg_lines.append("")
-    msg_lines.append("链接：")
-    for i, u in enumerate(aff_urls, 1):
-        msg_lines.append(f"{i}. {u}")
+                browser.close()
+            except Exception as e:
+                print("本轮检查异常:", e)
 
-    message = "\n".join(msg_lines)
-    send_discord(message)
-
-    return jsonify({"status": "ok"}), 200
-
-@app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
+            print(f"休眠 {CHECK_INTERVAL} 秒\n")
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    # 本地调试用，Cloud Run/Render 会用 gunicorn 启动
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    run_loop()
