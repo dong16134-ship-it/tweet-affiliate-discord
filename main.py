@@ -63,6 +63,7 @@ def run_loop():
     last_status = {}
     with sync_playwright() as p:
         while True:
+            browser = None
             try:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
@@ -90,9 +91,15 @@ def run_loop():
                     elif status is False:
                         last_status[url] = False
 
-                browser.close()
             except Exception as e:
                 print("本轮检查异常:", e)
+            finally:
+                # 无论本轮成功或异常都关闭浏览器，避免残留 chrome 进程占用内存
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception as e:
+                        print("关闭浏览器失败:", e)
 
             print(f"休眠 {CHECK_INTERVAL} 秒\n")
             time.sleep(CHECK_INTERVAL)
